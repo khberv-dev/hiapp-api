@@ -1,0 +1,133 @@
+import {
+  BadGatewayException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { GoogleProfile } from '../user/user.service.js';
+
+const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
+const REQUEST_TIMEOUT_MS = 10_000;
+const VALID_ISSUERS = new Set([
+  'accounts.google.com',
+  'https://accounts.google.com',
+]);
+
+/** Fields of Google's tokeninfo response we rely on. Values are strings. */
+interface TokenInfo {
+  iss?: string;
+  aud?: string;
+  sub?: string;
+  exp?: string;
+  email?: string;
+  email_verified?: string;
+  name?: string;
+  given_name?: string;
+  family_name?: string;
+}
+
+/**
+ * Validates a Google ID token with Google's tokeninfo endpoint and returns the
+ * profile. Google checks the signature and expiry; we also check the issuer
+ * and that the token was issued to one of *our* OAuth clients (`aud`), since
+ * any app can obtain a valid Google ID token.
+ */
+@Injectable()
+export class GoogleTokenVerifier {
+  private readonly logger = new Logger(GoogleTokenVerifier.name);
+  private readonly clientIds: Set<string>;
+
+  constructor(config: ConfigService) {
+    this.clientIds = new Set(
+      config
+        .getOrThrow<string>('GOOGLE_CLIENT_IDS')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean),
+    );
+  }
+
+  async verify(idToken: string): Promise<GoogleProfile> {
+    const info = await this.fetchTokenInfo(idToken);
+
+    if (
+      !info.sub ||
+      !VALID_ISSUERS.has(info.iss ?? '') ||
+      !this.clientIds.has(info.aud ?? '') ||
+      Number(info.exp) * 1000 <= Date.now()
+    ) {
+      throw new UnauthorizedException('Invalid Google ID token');
+    }
+
+    const email =
+      info.email && info.email_verified === 'true'
+        ? info.email.trim().toLowerCase()
+        : null;
+    const firstName =
+      info.given_name?.trim() ||
+      info.name?.trim() ||
+      email?.split('@')[0] ||
+      'User';
+
+    return {
+      googleId: info.sub,
+      firstName,
+      lastName: info.family_name?.trim() || null,
+      email,
+    };
+  }
+
+  private async fetchTokenInfo(idToken: string): Promise<TokenInfo> {
+    const url = new URL(TOKENINFO_URL);
+    url.searchParams.set('id_token', idToken);
+    // The ID token is a credential: log only enough of it to correlate.
+    const loggedUrl = `${TOKENINFO_URL}?id_token=${redact(idToken)}`;
+    this.logger.log(`Request: GET ${loggedUrl}`);
+
+    const startedAt = Date.now();
+    let response: Response;
+    let text: string;
+    try {
+      response = await fetch(url, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      text = await response.text();
+    } catch (error) {
+      this.logger.error(
+        `Request failed after ${Date.now() - startedAt}ms: GET ${loggedUrl}: ${(error as Error).message}`,
+      );
+      throw new BadGatewayException('Google is unavailable');
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+    // Google pretty-prints its JSON; log it on one line.
+    const loggedBody = body === null ? text : JSON.stringify(body);
+    this.logger.log(
+      `Response: ${response.status} in ${Date.now() - startedAt}ms: ${loggedBody}`,
+    );
+
+    // Google answers 400 for invalid, expired or malformed tokens.
+    if (response.status >= 400 && response.status < 500) {
+      throw new UnauthorizedException('Invalid Google ID token');
+    }
+    if (!response.ok) {
+      throw new BadGatewayException('Google is unavailable');
+    }
+    if (typeof body !== 'object' || body === null) {
+      throw new BadGatewayException('Google returned an invalid response');
+    }
+    return body as TokenInfo;
+  }
+}
+
+/** First and last few characters only, e.g. "eyJhbGciOi…Xk9q2w". */
+function redact(token: string): string {
+  return token.length <= 20
+    ? '[redacted]'
+    : `${token.slice(0, 10)}…${token.slice(-6)}`;
+}
