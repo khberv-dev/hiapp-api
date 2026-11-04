@@ -1,17 +1,18 @@
 import {
   Column,
+  CreateDateColumn,
   Entity,
   Index,
   ManyToOne,
   PrimaryGeneratedColumn,
+  UpdateDateColumn,
 } from 'typeorm';
-import { TimestampedEntity } from '../../../shared/entities/timestamped.entity.js';
 import { User } from '../../user/entities/user.entity.js';
 
 /** One voice conversation = one authenticated WebSocket connection. */
 @Entity('conversations')
 @Index(['userId', 'startedAt'])
-export class Conversation extends TimestampedEntity {
+export class Conversation {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
@@ -28,4 +29,10 @@ export class Conversation extends TimestampedEntity {
   /** When the client disconnected. Null while live, or if the server crashed mid-conversation. */
   @Column({ type: 'timestamptz', nullable: true })
   endedAt: Date | null;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updatedAt: Date;
 }

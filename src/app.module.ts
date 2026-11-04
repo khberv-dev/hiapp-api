@@ -7,6 +7,9 @@ import {
 } from './shared/config/database.config.js';
 import { UserModule } from './modules/user/user.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
+import { PlanModule } from './modules/plan/plan.module.js';
+import { SubscriptionModule } from './modules/subscription/subscription.module.js';
+import { InvoiceModule } from './modules/invoice/invoice.module.js';
 import { ConversationModule } from './modules/conversation/conversation.module.js';
 
 @Module({
@@ -23,6 +26,9 @@ import { ConversationModule } from './modules/conversation/conversation.module.j
     UserModule,
     AuthModule,
     ConversationModule,
+    PlanModule,
+    SubscriptionModule,
+    InvoiceModule,
   ],
 })
 export class AppModule {}

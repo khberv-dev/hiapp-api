@@ -81,53 +81,32 @@ export class GoogleTokenVerifier {
   private async fetchTokenInfo(idToken: string): Promise<TokenInfo> {
     const url = new URL(TOKENINFO_URL);
     url.searchParams.set('id_token', idToken);
-    // The ID token is a credential: log only enough of it to correlate.
-    const loggedUrl = `${TOKENINFO_URL}?id_token=${redact(idToken)}`;
-    this.logger.log(`Request: GET ${loggedUrl}`);
 
-    const startedAt = Date.now();
     let response: Response;
-    let text: string;
     try {
       response = await fetch(url, {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      text = await response.text();
     } catch (error) {
       this.logger.error(
-        `Request failed after ${Date.now() - startedAt}ms: GET ${loggedUrl}: ${(error as Error).message}`,
+        `tokeninfo request failed: ${(error as Error).message}`,
       );
       throw new BadGatewayException('Google is unavailable');
     }
-    let body: unknown;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = null;
-    }
-    // Google pretty-prints its JSON; log it on one line.
-    const loggedBody = body === null ? text : JSON.stringify(body);
-    this.logger.log(
-      `Response: ${response.status} in ${Date.now() - startedAt}ms: ${loggedBody}`,
-    );
 
     // Google answers 400 for invalid, expired or malformed tokens.
     if (response.status >= 400 && response.status < 500) {
       throw new UnauthorizedException('Invalid Google ID token');
     }
     if (!response.ok) {
+      this.logger.error(`tokeninfo responded ${response.status}`);
       throw new BadGatewayException('Google is unavailable');
     }
+
+    const body = (await response.json().catch(() => null)) as unknown;
     if (typeof body !== 'object' || body === null) {
       throw new BadGatewayException('Google returned an invalid response');
     }
     return body as TokenInfo;
   }
-}
-
-/** First and last few characters only, e.g. "eyJhbGciOi…Xk9q2w". */
-function redact(token: string): string {
-  return token.length <= 20
-    ? '[redacted]'
-    : `${token.slice(0, 10)}…${token.slice(-6)}`;
 }

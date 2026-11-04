@@ -17,6 +17,7 @@ import {
   type TtsPort,
 } from '../ai/ai.types.js';
 import type { JwtPayload } from '../auth/jwt-payload.js';
+import { SubscriptionService } from '../subscription/subscription.service.js';
 import { UserService } from '../user/user.service.js';
 import {
   ConversationService,
@@ -72,7 +73,8 @@ export class ConversationGateway
   private readonly logger = new Logger(ConversationGateway.name);
   private readonly connections = new Map<WebSocket, ActiveConnection>();
   private readonly clientByUser = new Map<string, WebSocket>();
-  private readonly dailyLimitSec: number;
+  /** For users without a current subscription. */
+  private readonly freeDailyLimitSec: number;
 
   constructor(
     @Inject(STT) private readonly stt: SttPort,
@@ -81,10 +83,14 @@ export class ConversationGateway
     private readonly jwtService: JwtService,
     private readonly userService: UserService,
     private readonly conversationService: ConversationService,
+    private readonly subscriptionService: SubscriptionService,
     config: ConfigService,
   ) {
-    this.dailyLimitSec = Number(config.getOrThrow('DAILY_LIMIT_SECONDS'));
-    if (!Number.isFinite(this.dailyLimitSec) || this.dailyLimitSec < 0) {
+    this.freeDailyLimitSec = Number(config.getOrThrow('DAILY_LIMIT_SECONDS'));
+    if (
+      !Number.isFinite(this.freeDailyLimitSec) ||
+      this.freeDailyLimitSec < 0
+    ) {
       throw new Error('DAILY_LIMIT_SECONDS must be a non-negative number');
     }
   }
@@ -117,8 +123,11 @@ export class ConversationGateway
         previous.close(CloseCode.Replaced, 'replaced by a new connection');
       }
 
-      const usedSec = await this.conversationService.usedSecondsToday(userId);
-      const remainingSec = Math.floor(this.dailyLimitSec - usedSec);
+      const [usedSec, dailyLimitSec] = await Promise.all([
+        this.conversationService.usedSecondsToday(userId),
+        this.dailyLimitFor(userId),
+      ]);
+      const remainingSec = Math.floor(dailyLimitSec - usedSec);
       if (remainingSec <= 0) {
         limitReached();
         return;
@@ -233,6 +242,19 @@ export class ConversationGateway
           `Failed to save ${role} turn of ${connection.conversationId}: ${String(err)}`,
         );
       });
+  }
+
+  /**
+   * The current subscription's plan limit, never below the free limit
+   * (a subscription should only ever add speaking time).
+   */
+  private async dailyLimitFor(userId: string): Promise<number> {
+    const subscription =
+      await this.subscriptionService.findCurrentByUser(userId);
+    return Math.max(
+      this.freeDailyLimitSec,
+      subscription?.plan.dailyLimitSeconds ?? 0,
+    );
   }
 
   /** Returns the user id for a valid token of an existing user, else null. */

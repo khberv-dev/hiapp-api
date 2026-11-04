@@ -1,11 +1,12 @@
 import {
   Column,
+  CreateDateColumn,
   Entity,
   Index,
   ManyToOne,
   PrimaryGeneratedColumn,
+  UpdateDateColumn,
 } from 'typeorm';
-import { TimestampedEntity } from '../../../shared/entities/timestamped.entity.js';
 import { Conversation } from './conversation.entity.js';
 
 export enum TurnRole {
@@ -16,7 +17,7 @@ export enum TurnRole {
 /** One transcript line of a conversation. Order by `createdAt`. */
 @Entity('turns')
 @Index(['conversationId', 'createdAt'])
-export class Turn extends TimestampedEntity {
+export class Turn {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
@@ -32,4 +33,10 @@ export class Turn extends TimestampedEntity {
   /** User: the final STT transcript. AI: the reply as heard (cut on barge-in). */
   @Column('text')
   text: string;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updatedAt: Date;
 }

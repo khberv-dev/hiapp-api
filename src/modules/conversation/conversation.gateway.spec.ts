@@ -10,6 +10,7 @@ import type {
   SttPort,
   TtsPort,
 } from '../ai/ai.types.js';
+import type { SubscriptionService } from '../subscription/subscription.service.js';
 import type { UserService } from '../user/user.service.js';
 import { ConversationGateway } from './conversation.gateway.js';
 import type { ConversationService } from './conversation.service.js';
@@ -34,7 +35,11 @@ const request = (url: string, headers: Record<string, string> = {}) =>
 const withToken = (token = 'good') =>
   request(`/v1/conversation?token=${token}`);
 
-function setup({ dailyLimit = 600, usedToday = 0 } = {}) {
+function setup({
+  dailyLimit = 600,
+  usedToday = 0,
+  planLimit = undefined as number | undefined,
+} = {}) {
   let sttCallbacks: SttCallbacks | undefined;
   const sttClose = vi.fn();
   const stt: SttPort = {
@@ -76,6 +81,15 @@ function setup({ dailyLimit = 600, usedToday = 0 } = {}) {
     touch: vi.fn(() => Promise.resolve()),
     addTurn: vi.fn(() => Promise.resolve()),
   };
+  const subscriptions = {
+    findCurrentByUser: vi.fn(() =>
+      Promise.resolve(
+        planLimit === undefined
+          ? null
+          : { plan: { dailyLimitSeconds: planLimit } },
+      ),
+    ),
+  };
   const config = {
     getOrThrow: () => String(dailyLimit),
   } as unknown as ConfigService;
@@ -86,6 +100,7 @@ function setup({ dailyLimit = 600, usedToday = 0 } = {}) {
     jwt as unknown as JwtService,
     users as unknown as UserService,
     conversations as unknown as ConversationService,
+    subscriptions as unknown as SubscriptionService,
     config,
   );
   return { gateway, conversations, sttClose, stt: () => sttCallbacks! };
@@ -146,6 +161,32 @@ describe('ConversationGateway', () => {
     expect(client.messages()).toEqual([{ type: 'limit_reached' }]);
     expect(client.close).toHaveBeenCalledWith(4403, 'daily limit reached');
     expect(conversations.start).not.toHaveBeenCalled();
+  });
+
+  it("uses the current subscription's plan limit", async () => {
+    const { gateway } = setup({
+      dailyLimit: 600,
+      usedToday: 900,
+      planLimit: 3600,
+    });
+    const client = new FakeClient();
+    await gateway.handleConnection(asWs(client), withToken());
+    expect(client.messages()).toContainEqual({
+      type: 'ready',
+      remainingSec: 2700,
+    });
+    await gateway.beforeApplicationShutdown();
+  });
+
+  it('never lets a plan lower the free limit', async () => {
+    const { gateway } = setup({ dailyLimit: 600, usedToday: 0, planLimit: 60 });
+    const client = new FakeClient();
+    await gateway.handleConnection(asWs(client), withToken());
+    expect(client.messages()).toContainEqual({
+      type: 'ready',
+      remainingSec: 600,
+    });
+    await gateway.beforeApplicationShutdown();
   });
 
   it('disconnects automatically when the remaining allowance runs out', async () => {

@@ -1,8 +1,13 @@
-import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
-import { TimestampedEntity } from '../../../shared/entities/timestamped.entity.js';
+import {
+  Column,
+  CreateDateColumn,
+  Entity,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 
 @Entity('users')
-export class User extends TimestampedEntity {
+export class User {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
@@ -19,4 +24,10 @@ export class User extends TimestampedEntity {
   /** Google account id (the ID token's `sub`). Null for other sign-in methods. */
   @Column({ type: 'varchar', nullable: true, unique: true })
   googleId: string | null;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updatedAt: Date;
 }
