@@ -25,6 +25,14 @@ export class User {
   @Column({ type: 'varchar', nullable: true, unique: true })
   googleId: string | null;
 
+  /**
+   * scrypt hash (`hashPassword`), never the plain password. Null until the
+   * user sets one. `select: false`: load it explicitly with
+   * `addSelect('user.password')` when it's needed.
+   */
+  @Column({ type: 'varchar', nullable: true, select: false })
+  password: string | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 

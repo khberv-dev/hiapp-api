@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from './entities/user.entity.js';
+import { hashPassword } from './password.js';
 
 export interface GoogleProfile {
   googleId: string;
@@ -31,5 +32,13 @@ export class UserService {
       { conflictPaths: ['googleId'], skipUpdateIfNoValuesChanged: false },
     );
     return this.userRepository.findOneByOrFail({ googleId: profile.googleId });
+  }
+
+  /** Sets or replaces the password (stored hashed). 404 if the user is gone. */
+  async updatePassword(id: string, password: string): Promise<void> {
+    const result = await this.userRepository.update(id, {
+      password: await hashPassword(password),
+    });
+    if (!result.affected) throw new NotFoundException('User not found');
   }
 }

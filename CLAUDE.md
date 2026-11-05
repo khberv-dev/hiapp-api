@@ -56,7 +56,8 @@ binary PCM16 16k ─► STT (Live API) ─► final transcript ─► LLM stream
 
 ## Users and auth
 
-- `User` (`src/modules/user/`, table `users`): `firstName` (required), `lastName` and `email` (nullable), `googleId` (nullable, unique), `createdAt`/`updatedAt`. `email` is not unique and is only stored if Google marks it verified.
+- `User` (`src/modules/user/`, table `users`): `firstName` (required), `lastName` and `email` (nullable), `googleId` (nullable, unique), `createdAt`/`updatedAt`, `password` (nullable).
+- **Password**: stored as a scrypt hash (`scrypt$<salt>$<hash>`, `password.ts`: `hashPassword`/`verifyPassword`), never in plain text. The column is `select: false`, so it's never loaded or returned unless a query adds it explicitly. `PUT /user/password` `{ password }` (8–128 chars, `JwtAuthGuard`) sets or replaces it without the old password and returns 204, or 404 if the user no longer exists. There's no password sign-in yet. `email` is not unique and is only stored if Google marks it verified.
 - `POST /auth/google` `{ idToken }` → 200 `{ accessToken, user: { id, firstName, lastName, email } }`. It is the only sign-in method.
   - `GoogleTokenVerifier` calls `https://oauth2.googleapis.com/tokeninfo?id_token=...`. Google checks the signature and expiry; we also require `iss` to be Google and `aud` to be one of `GOOGLE_CLIENT_IDS`. Without the `aud` check, a token issued to any other app would be accepted. Google's 4xx → 401; network errors and 5xx → 502.
   - `UserService.upsertFromGoogle` runs a single `INSERT ... ON CONFLICT (google_id) DO UPDATE`, so the profile is refreshed on every sign-in and concurrent first sign-ins can't create duplicates.
