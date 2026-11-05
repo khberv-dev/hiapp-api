@@ -9,6 +9,7 @@ import {
 import type { IncomingMessage } from 'node:http';
 import { type RawData, WebSocket } from 'ws';
 import {
+  type ChatTurn,
   LLM,
   type LlmPort,
   STT,
@@ -35,11 +36,16 @@ interface ActiveConnection {
   /** Auto-disconnect when the daily allowance runs out. */
   limitTimer: NodeJS.Timeout;
   heartbeat: NodeJS.Timeout;
+  /** WebSocket ping; a peer that misses a pong is terminated. */
+  ping: NodeJS.Timeout;
   /** Turn inserts, chained so they're stored in order. */
   writes: Promise<void>;
 }
 
 const ROLES = { user: TurnRole.User, ai: TurnRole.Ai } as const;
+const MAX_HISTORY_TURNS = 20;
+/** ~20 s of 24 kHz audio queued: the client isn't reading. */
+const MAX_BUFFERED_BYTES = 1_000_000;
 
 function toBuffer(data: RawData): Buffer {
   if (Buffer.isBuffer(data)) return data;
@@ -47,20 +53,25 @@ function toBuffer(data: RawData): Buffer {
   return Buffer.from(data);
 }
 
-/** Access token from `?token=` or an `Authorization: Bearer` header. */
+/**
+ * Access token from the `Authorization: Bearer` header only: query strings
+ * end up in proxy and access logs.
+ */
 function extractToken(request: IncomingMessage): string | null {
-  const fromQuery = new URL(
-    request.url ?? '/',
-    'http://localhost',
-  ).searchParams.get('token');
-  if (fromQuery) return fromQuery;
   const [type, token] = request.headers.authorization?.split(' ') ?? [];
   return type === 'Bearer' && token ? token : null;
 }
 
+function resumeParam(request: IncomingMessage): string | null {
+  return new URL(request.url ?? '/', 'http://localhost').searchParams.get(
+    'resume',
+  );
+}
+
 /**
- * ws://host/v1/conversation?token=<accessToken>
- * Binary frames carry audio, text frames carry JSON control.
+ * ws://host/v1/conversation[?resume=<conversationId>], with an
+ * `Authorization: Bearer <accessToken>` header. Binary frames carry audio,
+ * text frames carry JSON control (see protocol.ts).
  *
  * Each connection is recorded as a `Conversation` with its `Turn`s, and is
  * limited by the user's remaining daily allowance (DAILY_LIMIT_SECONDS).
@@ -73,8 +84,13 @@ export class ConversationGateway
   private readonly logger = new Logger(ConversationGateway.name);
   private readonly connections = new Map<WebSocket, ActiveConnection>();
   private readonly clientByUser = new Map<string, WebSocket>();
+  /** End-of-conversation writes in progress, so a resume can wait for them. */
+  private readonly releasing = new Map<string, Promise<void>>();
   /** For users without a current subscription. */
   private readonly freeDailyLimitSec: number;
+  private readonly pingMs: number;
+  private readonly resumeWindowSec: number;
+  private readonly sendTurnMetrics: boolean;
 
   constructor(
     @Inject(STT) private readonly stt: SttPort,
@@ -93,6 +109,9 @@ export class ConversationGateway
     ) {
       throw new Error('DAILY_LIMIT_SECONDS must be a non-negative number');
     }
+    this.pingMs = Number(config.get('WS_PING_MS') || 15_000);
+    this.resumeWindowSec = Number(config.get('RESUME_WINDOW_SEC') || 120);
+    this.sendTurnMetrics = config.get('SEND_TURN_METRICS') === 'true';
   }
 
   async handleConnection(
@@ -123,6 +142,8 @@ export class ConversationGateway
         previous.close(CloseCode.Replaced, 'replaced by a new connection');
       }
 
+      const resumable = await this.findResumable(userId, resumeParam(request));
+
       const [usedSec, dailyLimitSec] = await Promise.all([
         this.conversationService.usedSecondsToday(userId),
         this.dailyLimitFor(userId),
@@ -133,51 +154,94 @@ export class ConversationGateway
         return;
       }
 
-      const conversation = await this.conversationService.start(userId);
+      let conversationId: string;
+      let initialHistory: ChatTurn[] | undefined;
+      if (resumable) {
+        conversationId = resumable;
+        [initialHistory] = await Promise.all([
+          this.conversationService.recentTurns(
+            conversationId,
+            MAX_HISTORY_TURNS,
+          ),
+          this.conversationService.reopen(conversationId),
+        ]);
+      } else {
+        conversationId = (await this.conversationService.start(userId)).id;
+      }
       // The client may have left while we were authenticating / saving.
       if (client.readyState !== WebSocket.OPEN) {
-        await this.conversationService.end(conversation.id);
+        await this.conversationService.end(conversationId);
         return;
       }
 
       const connection = {
         userId,
-        conversationId: conversation.id,
+        conversationId,
         writes: Promise.resolve(),
       } as ActiveConnection;
+      let overflowed = false;
       connection.session = new ConversationSession(
         {
           sendJson: send,
           sendAudio: (pcm) => {
-            if (client.readyState === WebSocket.OPEN)
-              client.send(pcm, { binary: true });
+            if (client.readyState !== WebSocket.OPEN || overflowed) return;
+            if (client.bufferedAmount > MAX_BUFFERED_BYTES) {
+              overflowed = true;
+              this.logger.warn(
+                `Client of ${conversationId} stopped reading, terminating`,
+              );
+              client.terminate();
+              return;
+            }
+            client.send(pcm, { binary: true });
           },
           close: (code, reason) => client.close(code, reason),
         },
         { stt: this.stt, llm: this.llm, tts: this.tts },
         {
           systemPrompt: DEFAULT_SYSTEM_PROMPT,
+          conversationId,
+          maxHistoryTurns: MAX_HISTORY_TURNS,
           remainingSec,
+          initialHistory,
+          resumed: !!resumable,
+          sendTurnMetrics: this.sendTurnMetrics,
           onTurn: (role, text) => this.saveTurn(connection, ROLES[role], text),
         },
       );
       connection.limitTimer = setTimeout(limitReached, remainingSec * 1000);
       connection.heartbeat = setInterval(() => {
-        this.conversationService
-          .touch(conversation.id)
-          .catch((err: unknown) => {
-            this.logger.warn(
-              `Heartbeat failed for ${conversation.id}: ${String(err)}`,
-            );
-          });
+        this.conversationService.touch(conversationId).catch((err: unknown) => {
+          this.logger.warn(
+            `Heartbeat failed for ${conversationId}: ${String(err)}`,
+          );
+        });
       }, HEARTBEAT_SECONDS * 1000);
+
+      // A dead phone would otherwise hold a Live session and keep spending
+      // its allowance until TCP times out. terminate() → handleDisconnect.
+      let alive = true;
+      client.on('pong', () => (alive = true));
+      connection.ping = setInterval(() => {
+        if (!alive) return client.terminate();
+        alive = false;
+        if (client.readyState === WebSocket.OPEN) client.ping();
+      }, this.pingMs);
 
       this.connections.set(client, connection);
       this.clientByUser.set(userId, client);
 
+      // An exception thrown in a `ws` listener is uncaught and would take
+      // down every session in the process.
       client.on('message', (data: RawData, isBinary: boolean) => {
-        if (isBinary) connection.session.handleAudio(toBuffer(data));
-        else connection.session.handleText(toBuffer(data).toString('utf8'));
+        try {
+          if (isBinary) connection.session.handleAudio(toBuffer(data));
+          else connection.session.handleText(toBuffer(data).toString('utf8'));
+        } catch (err) {
+          this.logger.error(
+            `Message handling failed for ${conversationId}: ${String(err)}`,
+          );
+        }
       });
 
       await connection.session.start();
@@ -217,14 +281,47 @@ export class ConversationGateway
 
     clearTimeout(connection.limitTimer);
     clearInterval(connection.heartbeat);
+    clearInterval(connection.ping);
     connection.session.close(); // may record the interrupted AI reply
-    await connection.writes;
+    const { conversationId } = connection;
+    const ending = (async () => {
+      await connection.writes;
+      try {
+        await this.conversationService.end(conversationId);
+      } catch (err) {
+        this.logger.error(
+          `Failed to end conversation ${conversationId}: ${String(err)}`,
+        );
+      }
+    })();
+    this.releasing.set(conversationId, ending);
+    await ending;
+    if (this.releasing.get(conversationId) === ending)
+      this.releasing.delete(conversationId);
+  }
+
+  /**
+   * The id to resume, if `id` is the user's conversation within the resume
+   * window. Never throws: a bad id just starts a new conversation.
+   */
+  private async findResumable(
+    userId: string,
+    id: string | null,
+  ): Promise<string | null> {
+    if (!id) return null;
     try {
-      await this.conversationService.end(connection.conversationId);
-    } catch (err) {
-      this.logger.error(
-        `Failed to end conversation ${connection.conversationId}: ${String(err)}`,
+      // Let a still-running release write `endedAt` first, or it would end
+      // the conversation right after we reopen it.
+      await this.releasing.get(id);
+      const found = await this.conversationService.findResumable(
+        userId,
+        id,
+        this.resumeWindowSec,
       );
+      return found?.id ?? null;
+    } catch (err) {
+      this.logger.warn(`Resume lookup failed: ${String(err)}`);
+      return null;
     }
   }
 

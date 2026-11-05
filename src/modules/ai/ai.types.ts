@@ -8,8 +8,15 @@ export interface SttCallbacks {
   onInterim(text: string): void;
   /** Committed text for a finished utterance. */
   onFinal(text: string): void;
-  /** The upstream connection closed without us asking. */
+  /**
+   * The connection is gone for good. From a resilient wrapper this means
+   * reconnecting failed (budget exhausted or an auth error).
+   */
   onUnexpectedClose(reason: string): void;
+  /** The server will end this connection soon (Live API `goAway`). */
+  onGoAway?(timeLeftMs?: number): void;
+  /** Reported by a resilient wrapper while it reconnects transparently. */
+  onStatus?(status: 'reconnecting' | 'ok'): void;
 }
 
 export interface SttConnection {
@@ -29,10 +36,14 @@ export interface ChatTurn {
   text: string;
 }
 
+/** Which provider entry actually served a request, e.g. `gemini:gemini-3.6-flash`. */
+export type OnServed = (provider: string) => void;
+
 export interface LlmRequest {
   systemPrompt: string;
   history: ChatTurn[];
   signal: AbortSignal;
+  onServed?: OnServed;
 }
 
 export interface LlmPort {
@@ -43,7 +54,11 @@ export interface LlmPort {
 export interface TtsPort {
   /** Sample rate of the PCM s16le mono chunks yielded by `synthesize`. */
   readonly sampleRate: number;
-  synthesize(text: string, signal: AbortSignal): AsyncIterable<Buffer>;
+  synthesize(
+    text: string,
+    signal: AbortSignal,
+    onServed?: OnServed,
+  ): AsyncIterable<Buffer>;
 }
 
 export const STT = Symbol('STT');

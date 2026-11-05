@@ -21,9 +21,14 @@ class FakeClient extends EventEmitter {
   send = (data: unknown) => {
     if (typeof data === 'string') this.sent.push(data);
   };
+  bufferedAmount = 0;
   close = vi.fn((_code?: number, _reason?: string) => {
     this.readyState = WebSocket.CLOSED;
   });
+  terminate = vi.fn(() => {
+    this.readyState = WebSocket.CLOSED;
+  });
+  ping = vi.fn();
   messages() {
     return this.sent.map((s) => JSON.parse(s) as { type: string });
   }
@@ -32,13 +37,14 @@ class FakeClient extends EventEmitter {
 const asWs = (c: FakeClient) => c as unknown as WebSocket;
 const request = (url: string, headers: Record<string, string> = {}) =>
   ({ url, headers }) as unknown as IncomingMessage;
-const withToken = (token = 'good') =>
-  request(`/v1/conversation?token=${token}`);
+const withToken = (token = 'good', query = '') =>
+  request(`/v1/conversation${query}`, { authorization: `Bearer ${token}` });
 
 function setup({
   dailyLimit = 600,
   usedToday = 0,
   planLimit = undefined as number | undefined,
+  resumable = null as { id: string } | null,
 } = {}) {
   let sttCallbacks: SttCallbacks | undefined;
   const sttClose = vi.fn();
@@ -80,6 +86,14 @@ function setup({
     end: vi.fn(() => Promise.resolve()),
     touch: vi.fn(() => Promise.resolve()),
     addTurn: vi.fn(() => Promise.resolve()),
+    findResumable: vi.fn(() => Promise.resolve(resumable)),
+    reopen: vi.fn(() => Promise.resolve()),
+    recentTurns: vi.fn(() =>
+      Promise.resolve([
+        { role: 'user', text: 'I like tea.' },
+        { role: 'assistant', text: 'Green or black?' },
+      ]),
+    ),
   };
   const subscriptions = {
     findCurrentByUser: vi.fn(() =>
@@ -92,6 +106,7 @@ function setup({
   };
   const config = {
     getOrThrow: () => String(dailyLimit),
+    get: () => undefined,
   } as unknown as ConfigService;
   const gateway = new ConversationGateway(
     stt,
@@ -103,15 +118,25 @@ function setup({
     subscriptions as unknown as SubscriptionService,
     config,
   );
-  return { gateway, conversations, sttClose, stt: () => sttCallbacks! };
+  return {
+    gateway,
+    conversations,
+    sttClose,
+    llm,
+    stt: () => sttCallbacks!,
+  };
 }
 
 describe('ConversationGateway', () => {
   afterEach(() => vi.useRealTimers());
 
-  it('rejects connections without a valid token with 4401', async () => {
+  it('rejects connections without a valid header token with 4401', async () => {
     const { gateway, conversations } = setup();
-    for (const req of [request('/v1/conversation'), withToken('bad')]) {
+    for (const req of [
+      request('/v1/conversation'),
+      request('/v1/conversation?token=good'), // query tokens are not accepted
+      withToken('bad'),
+    ]) {
       const client = new FakeClient();
       await gateway.handleConnection(asWs(client), req);
       expect(client.close).toHaveBeenCalledWith(4401, 'unauthorized');
@@ -128,6 +153,7 @@ describe('ConversationGateway', () => {
     expect(client.messages()).toContainEqual({
       type: 'ready',
       remainingSec: 499,
+      conversationId: 'conv-1',
     });
 
     gateway.handleDisconnect(asWs(client));
@@ -137,13 +163,10 @@ describe('ConversationGateway', () => {
     expect(sttClose).toHaveBeenCalled();
   });
 
-  it('accepts an Authorization header and ends open conversations on shutdown', async () => {
+  it('ends open conversations on shutdown', async () => {
     const { gateway, conversations } = setup();
     const client = new FakeClient();
-    await gateway.handleConnection(
-      asWs(client),
-      request('/v1/conversation', { authorization: 'Bearer good' }),
-    );
+    await gateway.handleConnection(asWs(client), withToken());
     expect(conversations.start).toHaveBeenCalledWith('user-1');
 
     await gateway.beforeApplicationShutdown();
@@ -174,6 +197,7 @@ describe('ConversationGateway', () => {
     expect(client.messages()).toContainEqual({
       type: 'ready',
       remainingSec: 2700,
+      conversationId: 'conv-1',
     });
     await gateway.beforeApplicationShutdown();
   });
@@ -185,6 +209,7 @@ describe('ConversationGateway', () => {
     expect(client.messages()).toContainEqual({
       type: 'ready',
       remainingSec: 600,
+      conversationId: 'conv-1',
     });
     await gateway.beforeApplicationShutdown();
   });
@@ -266,5 +291,117 @@ describe('ConversationGateway', () => {
     await gateway.handleConnection(asWs(client), withToken());
     expect(conversations.end).toHaveBeenCalledWith('conv-x');
     expect(client.sent).toEqual([]);
+  });
+
+  it('resumes a recent conversation with its turns as context', async () => {
+    const id = '7f1d9a52-3c4b-4e8a-9a0e-2b6c1d3e4f50';
+    const { gateway, conversations, stt } = setup({ resumable: { id } });
+    const client = new FakeClient();
+    await gateway.handleConnection(
+      asWs(client),
+      withToken('good', `?resume=${id}`),
+    );
+
+    expect(conversations.findResumable).toHaveBeenCalledWith('user-1', id, 120);
+    expect(conversations.reopen).toHaveBeenCalledWith(id);
+    expect(conversations.start).not.toHaveBeenCalled();
+    expect(client.messages()).toContainEqual({
+      type: 'ready',
+      remainingSec: 600,
+      conversationId: id,
+      resumed: true,
+    });
+    stt().onFinal('Green, please.');
+    await vi.waitFor(() =>
+      expect(conversations.addTurn).toHaveBeenCalledWith(
+        id,
+        'user',
+        'Green, please.',
+      ),
+    );
+    await gateway.beforeApplicationShutdown();
+    expect(conversations.end).toHaveBeenCalledWith(id);
+  });
+
+  it('starts a new conversation when the resume id is not resumable', async () => {
+    // Another user's id or an expired one: findResumable returns null.
+    const { gateway, conversations } = setup({ resumable: null });
+    const client = new FakeClient();
+    await gateway.handleConnection(
+      asWs(client),
+      withToken('good', '?resume=not-mine'),
+    );
+    expect(conversations.reopen).not.toHaveBeenCalled();
+    expect(conversations.start).toHaveBeenCalledWith('user-1');
+    expect(client.messages()).toContainEqual({
+      type: 'ready',
+      remainingSec: 600,
+      conversationId: 'conv-1',
+    });
+    await gateway.beforeApplicationShutdown();
+  });
+
+  it('never fails the connect because of a broken resume lookup', async () => {
+    const { gateway, conversations } = setup();
+    conversations.findResumable.mockImplementationOnce(() =>
+      Promise.reject(new Error('db down')),
+    );
+    const client = new FakeClient();
+    await gateway.handleConnection(
+      asWs(client),
+      withToken('good', '?resume=x'),
+    );
+    expect(conversations.start).toHaveBeenCalled();
+    expect(client.close).not.toHaveBeenCalled();
+    await gateway.beforeApplicationShutdown();
+  });
+
+  it('terminates a peer that stops answering pings', async () => {
+    vi.useFakeTimers();
+    const { gateway, conversations } = setup();
+    const client = new FakeClient();
+    await gateway.handleConnection(asWs(client), withToken());
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(client.ping).toHaveBeenCalledTimes(1);
+    client.emit('pong');
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(client.terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000); // no pong this time
+    expect(client.terminate).toHaveBeenCalled();
+
+    gateway.handleDisconnect(asWs(client));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(conversations.end).toHaveBeenCalledWith('conv-1');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('survives exceptions thrown while handling a message', async () => {
+    const { gateway } = setup();
+    const client = new FakeClient();
+    await gateway.handleConnection(asWs(client), withToken());
+    // A text frame that makes the session throw must not escape the listener.
+    const session = (
+      gateway as unknown as {
+        connections: Map<unknown, { session: { handleText(s: string): void } }>;
+      }
+    ).connections.get(client)!.session;
+    session.handleText = () => {
+      throw new Error('boom');
+    };
+    expect(() =>
+      client.emit('message', Buffer.from('{}'), false),
+    ).not.toThrow();
+    await gateway.beforeApplicationShutdown();
+  });
+
+  it('terminates a client that stops reading audio', async () => {
+    const { gateway, stt } = setup();
+    const client = new FakeClient();
+    await gateway.handleConnection(asWs(client), withToken());
+    client.bufferedAmount = 2_000_000;
+    stt().onFinal('Hello there, how are you?');
+    await vi.waitFor(() => expect(client.terminate).toHaveBeenCalledTimes(1));
+    await gateway.beforeApplicationShutdown();
   });
 });

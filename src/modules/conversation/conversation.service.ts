@@ -1,7 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, Repository } from 'typeorm';
+import { isUUID } from 'class-validator';
+import { IsNull, MoreThan, Repository } from 'typeorm';
+import type { ChatTurn } from '../ai/ai.types.js';
 import { Conversation } from './entities/conversation.entity.js';
 import { Turn, TurnRole } from './entities/turn.entity.js';
 
@@ -46,6 +48,52 @@ export class ConversationService {
       { id, endedAt: IsNull() },
       { updatedAt: new Date() },
     );
+  }
+
+  /**
+   * The user's conversation `id` if it is still open or ended less than
+   * `windowSec` ago, else null (also for ids that aren't uuids).
+   */
+  async findResumable(
+    userId: string,
+    id: string,
+    windowSec: number,
+  ): Promise<Conversation | null> {
+    if (!isUUID(id)) return null;
+    const since = new Date(Date.now() - windowSec * 1000);
+    return this.conversationRepository.findOne({
+      where: [
+        { id, userId, endedAt: IsNull() },
+        { id, userId, endedAt: MoreThan(since) },
+      ],
+    });
+  }
+
+  /**
+   * Marks a resumed conversation live again. The gap since it ended counts as
+   * used time: usage is measured from `startedAt` of this one row.
+   */
+  async reopen(id: string): Promise<void> {
+    await this.conversationRepository.update(
+      { id },
+      { endedAt: null, updatedAt: new Date() },
+    );
+  }
+
+  /** The last `limit` turns, oldest first, as LLM history. */
+  async recentTurns(
+    conversationId: string,
+    limit: number,
+  ): Promise<ChatTurn[]> {
+    const turns = await this.turnRepository.find({
+      where: { conversationId },
+      order: { createdAt: 'DESC' },
+      take: limit,
+    });
+    return turns.reverse().map((t) => ({
+      role: t.role === TurnRole.Ai ? 'assistant' : 'user',
+      text: t.text,
+    }));
   }
 
   async addTurn(

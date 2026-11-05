@@ -12,16 +12,30 @@ Pipeline per user utterance, all via Google Gemini (`@google/genai`):
 binary PCM16 16k ─► STT (Live API) ─► final transcript ─► LLM stream ─► SentenceSplitter ─► TTS per sentence ─► binary PCM16 24k
 ```
 
-- `src/modules/ai/`: one Gemini service per stage behind provider-agnostic ports in `ai.types.ts` (`SttPort`, `LlmPort`, `TtsPort`), injected via the `STT`/`LLM`/`TTS` tokens. Orchestration code must depend only on the ports so tests can use fakes.
-  - STT: `ai.live.connect` with `inputAudioTranscription`; interim text arrives as `serverContent.interimInputTranscription`, final text as `inputTranscription`. The SDK's `connect()` never settles if the server closes before setup (e.g. bad API key), so `GeminiSttService` races it against close/timeout itself.
-  - LLM: `models.generateContentStream` with a model fallback chain (`LLM_MODELS`); it only falls back if no token was emitted yet.
-  - TTS: `ai.interactions.create({ stream: true, response_format: { type: 'audio', mime_type: 'audio/l16' } })`, reading `step.delta` audio events. This is the current Gemini streaming-TTS API, not `generateContentStream`.
-- `src/modules/conversation/`: `ConversationGateway` (raw `ws` via `WsAdapter`, path `/v1/conversation`) authenticates the connection, records a `Conversation` row, then creates one `ConversationSession` per connection. The session is a plain class, not a Nest provider, and owns the whole turn lifecycle:
-  - STT stays open for the whole connection and auto-reconnects (Live sessions are capped at ~10 min). Connections that die quickly count as failures, so it gives up with close code 1011 instead of looping.
+- `src/modules/ai/`: provider-agnostic ports in `ai.types.ts` (`SttPort`, `LlmPort`, `TtsPort`), injected via the `STT`/`LLM`/`TTS` tokens and assembled in `ai.module.ts` factories. Orchestration code must depend only on the ports so tests can use fakes. **All resilience lives in this layer**, as composites/decorators around single-model adapters (`GeminiStt`, `GeminiLlm`, `GeminiTts`):
+  - `provider-error.ts`: every adapter throws a `ProviderError` with a `kind` (`overloaded`, `rate_limited`, `timeout`, `network`, `auth`, `bad_request`, `unknown`) via `classifyGeminiError`. `auth`/`bad_request` are never retried. `retryAfterMs` comes from the `retry-after` header, a `RetryInfo` detail, or "retry in 2h9m16s" in the message. A real TTS 429 has the header and the text but no `RetryInfo`.
+  - `fallback.ts` (`fallbackStream`): the shared chain. Each attempt has a first-event deadline (`firstEventDeadline` in `retry.ts`). Before the first item it retries or moves to the next entry; after the first item an error is rethrown, because the user already got part of it. Each entry has a `CircuitBreaker`: 5 retryable failures in 30 s, or a server retry hint of 20 s or more, opens it. An open entry is skipped until a half-open trial. If every entry is open, all are tried anyway.
+  - LLM (`FallbackLlm`, chain `LLM_MODELS`): `models.generateContentStream`. A missed first-token deadline (`LLM_FIRST_TOKEN_MS`) or a 429 moves to the next model at once. `overloaded`/`network` get one jittered retry first.
+  - TTS (`FallbackTts`, chain `TTS_MODELS`): `ai.interactions.create({ stream: true, response_format: { type: 'audio', mime_type: 'audio/l16' } })`, reading `step.delta` audio events. This is the current Gemini streaming-TTS API, not `generateContentStream`.
+    - The Interactions client retries 429/5xx internally (up to 4 times, 30 s), so `GeminiTts` passes `maxRetries: 0`.
+    - `FallbackTts` retries `TTS_RETRIES` times per model, with a `TTS_FIRST_CHUNK_MS` deadline per attempt. A 429 whose hint exceeds 1.5 s isn't retried.
+    - All entries must share one `sampleRate`, checked in the constructor. A different-rate provider must resample in its adapter.
+  - STT (`ResilientStt` wrapping `GeminiStt`): `ai.live.connect` with `inputAudioTranscription` (pinned by `STT_LANGUAGES`, default `en-US`) and `automaticActivityDetection` (`STT_SILENCE_MS`, high end-of-speech sensitivity). Interim text arrives as `serverContent.interimInputTranscription`, final text as `inputTranscription`.
+    - The SDK's `connect()` never settles if the server closes before setup (e.g. bad API key), so `GeminiStt` races it against close/timeout itself.
+    - `GeminiStt` reports `goAway` through `onGoAway` and doesn't reconnect.
+    - `ResilientStt` handles `goAway` make-before-break: it opens a new connection, switches audio to it, calls `endOfAudio()` on the old one, and still accepts that one's final for `drainMs`.
+    - On a drop it reconnects with full-jitter backoff for up to `STT_RECONNECT_BUDGET_MS`, reporting `onStatus('reconnecting'|'ok')`. It then replays the audio received since the last final, at most `STT_REPLAY_BUFFER_MS`.
+    - `onUnexpectedClose` reaches the session only when the budget is spent, after too many connections in a row die within 5 s, or on an `auth` error (immediately).
+    - `audioStreamEnd` (`end_of_audio`) does *not* end the Live stream: later audio still gets transcribed. This was verified live.
+  - `fault-injection.ts`: `AI_FAULT_RATE` (testing only) wraps every port with random injected 503s and STT drops.
+- `src/modules/conversation/`: `ConversationGateway` (raw `ws` via `WsAdapter`, path `/v1/conversation`) authenticates the connection, records (or resumes) a `Conversation` row, then creates one `ConversationSession` per connection. The session is a plain class, not a Nest provider, and owns the whole turn lifecycle:
+  - It opens STT once. Reconnecting is the port's job: the session relays `status` messages, and when the port gives up it aborts the turn and closes with 1011.
   - Each turn has its own `AbortController`. A new final transcript or an `interrupt` message aborts the turn (barge-in), sends `tts_stop`, and keeps only the fully spoken sentences in history.
-  - TTS for each sentence starts as soon as the splitter emits it (`prefetch`), but audio is sent strictly in order through a promise chain.
-- The wire protocol is documented at the top of `src/modules/conversation/protocol.ts`. `scripts/test-client.mjs <file.pcm>` streams a 16 kHz PCM file and writes the reply to `out.pcm`.
-- **WebSocket auth**: the access token from `/auth/google` comes as `?token=` or an `Authorization: Bearer` header. The gateway verifies it with `JwtService` and checks that the user still exists; otherwise it closes with 4401 (`CloseCode` in `protocol.ts`). Auth happens in `handleConnection`, so frames the client sends before `ready` are dropped.
+  - TTS for each sentence starts as soon as the splitter emits it (`prefetch`), but audio is sent strictly in order through a promise chain. A sentence that still fails after the TTS retries is **skipped**. The turn fails (`error`) only if no sentence produced audio; otherwise it gets `tts_end` and the full LLM text is kept in history.
+  - `SentenceSplitter({ minChars: 20, firstChunkMaxChars: 60 })`: if the first chunk has no sentence end within 60 chars, it is cut at the last clause boundary (`, ; : —`), so the first TTS request starts sooner. Later chunks are whole sentences.
+  - **Turn timing**: `TurnTimer` logs one JSON line per turn (`{"evt":"turn",...}`), with no transcript text. It has the marks `final` (t=0), `llmFirstToken`, `firstSentence`, `ttsFirstChunk`, `firstAudioSent`, `llmDone` and one of `ttsEnd`/`aborted`/`failed`, plus `finalLagMs` (final vs. the client's `end_of_audio`, or the last interim) and `served.{llm,tts}` (the provider entry that answered). `SEND_TURN_METRICS=true` also sends it to the client as `turn_metrics`.
+- The wire protocol is documented at the top of `src/modules/conversation/protocol.ts`. `TOKEN=<accessToken> node scripts/test-client.mjs <file.pcm>` streams a 16 kHz PCM file and writes the reply to `out.pcm`.
+- **WebSocket auth**: the access token from `/auth/google` must be sent in an `Authorization: Bearer` header. `?token=` is not accepted, because query strings end up in proxy and access logs. The gateway verifies it with `JwtService` and checks that the user still exists; otherwise it closes with 4401 (`CloseCode` in `protocol.ts`). Auth happens in `handleConnection`, so frames the client sends before `ready` are dropped.
 - **Conversation records**: `Conversation` (table `conversations`): `userId` (FK → `users`, `ON DELETE CASCADE`), `startedAt` set when the connection is accepted, `endedAt` set on disconnect. `ConversationService.end` is idempotent (`WHERE ended_at IS NULL`). `beforeApplicationShutdown` ends conversations still open at shutdown, so only a crash leaves `endedAt` null. A connection whose STT fails to start is still recorded, with near-equal start and end.
 - **Transcripts**: `Turn` (table `turns`): `conversationId` (FK, cascade), `role` (Postgres enum `user` | `ai`, `TurnRole` in code), `text`. Order turns by `createdAt`. The session reports turns through the `onTurn` option: each final STT transcript is a `user` turn. Each AI reply is an `ai` turn once fully spoken; on barge-in or disconnect, only the fully spoken sentences are saved, and nothing if none were. The gateway chains each connection's inserts on one promise, so they land in order and are flushed before `endedAt` is written.
 - **Daily limit**: conversation time per user per calendar day in `USAGE_TIMEZONE` (IANA name, default `UTC`).
@@ -31,6 +45,13 @@ binary PCM16 16k ─► STT (Live API) ─► final transcript ─► LLM stream
   - Usage = sum of conversation durations clipped to today, so a conversation crossing midnight counts only from midnight. An open conversation counts up to `min(now, updatedAt + HEARTBEAT_SECONDS)`. Live connections bump `updatedAt` every 30 s (`touch`), so one orphaned by a crash stops counting about 30 s after its last heartbeat instead of growing forever.
   - One live connection per user (per server instance): a new connection closes the previous one with 4409 and ends its conversation *before* usage is computed. Otherwise parallel sockets could each spend the full remaining allowance.
   - The timer is armed with the day's remaining time, so a conversation that crosses midnight is still cut at that allowance.
+- **Resume**: `?resume=<conversationId>` (the id comes from `ready`). It is accepted only if the conversation is the user's and still open or ended less than `RESUME_WINDOW_SEC` (default 120) ago (`ConversationService.findResumable`).
+  - When accepted, the row is reopened (`endedAt = null`), its last 20 turns are loaded as LLM history, and `ready` has `resumed: true`.
+  - Otherwise a new conversation starts. A bad id never fails the connect.
+  - The gateway first waits for a still-running `release()` of that conversation, so its `end()` can't land after the reopen.
+  - The gap between disconnect and resume counts as used time, because usage is measured from the row's `startedAt`.
+- **Liveness**: the gateway pings every `WS_PING_MS` (15 s) and terminates a peer that missed the previous pong. Without this, a dead phone would hold a Live session and spend its allowance until TCP times out. A client whose `bufferedAmount` exceeds 1 MB (~20 s of audio, i.e. it isn't reading) is terminated. `ws` message handlers are wrapped in try/catch, since an exception there would crash every session in the process.
+- **Multiple instances**: one-connection-per-user, the resume wait and the circuit breakers are in-memory, per process. Running more than one instance needs a shared lock (Redis or a Postgres advisory lock) for the per-user rule.
 - There's no other rate limiting.
 
 ## Users and auth
@@ -68,6 +89,7 @@ The structure mirrors the sibling project `pointvpn-api`:
 - Module, service and controller names are **singular** (`user/`, `UserService`, `plan/`, `PlanService`); table names are plural (`users`, `plans`).
 - `src/modules/`: feature modules, each with its own `*.module.ts` (and `entities/` once it has tables). Register new modules in `AppModule.imports`.
 - `src/shared/entities/`: column transformers (`numberTransformer` for `numeric`/`bigint`).
+- `public/`: static files served at the root by `useStaticAssets` in `main.ts` (`.html` optional in the URL, e.g. `/privacy_policy`). It's resolved relative to `dist/`, so it must stay at the project root and be deployed alongside `dist/`.
 - `src/shared/config/`: configuration. `database.config.ts` builds the TypeORM `DataSourceOptions` from env and creates the `DataSource`; `AppModule` feeds both into `TypeOrmModule.forRootAsync` (`useFactory` + `dataSourceFactory`).
 
 ## Database
@@ -110,7 +132,7 @@ npx vitest run -t "test name pattern"      # single test by name
 
 ## Runtime configuration
 
-- `PORT`, `GEMINI_API_KEY`, `JWT_SECRET`, `GOOGLE_CLIENT_IDS` (comma-separated), `DAILY_LIMIT_SECONDS`, `RHMT_API_URL`, `RHMT_APPLICATION_ID`, `RHMT_SECRET`, `RHMT_STORE_ID`, `RHMT_CALLBACK_URL` and `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME` are required and read with `getOrThrow`, so the app won't start without them (see `.env.example` for optional model/voice overrides). `ConfigModule.forRoot({ isGlobal: true })` reads `.env` from the project root (gitignored), so `ConfigService` can be injected anywhere without importing `ConfigModule`.
+- `PORT`, `GEMINI_API_KEY`, `JWT_SECRET`, `GOOGLE_CLIENT_IDS` (comma-separated), `DAILY_LIMIT_SECONDS`, `RHMT_API_URL`, `RHMT_APPLICATION_ID`, `RHMT_SECRET`, `RHMT_STORE_ID`, `RHMT_CALLBACK_URL` and `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME` are required and read with `getOrThrow`, so the app won't start without them (see `.env.example` for the optional overrides: models and chains, deadlines, retries, STT language/silence/reconnect budget, `WS_PING_MS`, `RESUME_WINDOW_SEC`, `SEND_TURN_METRICS`, and `AI_FAULT_RATE` for testing only). `ConfigModule.forRoot({ isGlobal: true })` reads `.env` from the project root (gitignored), so `ConfigService` can be injected anywhere without importing `ConfigModule`.
 
 ## Toolchain conventions that differ from a typical Nest project
 

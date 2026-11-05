@@ -1,4 +1,5 @@
 import type {
+  ChatTurn,
   LlmPort,
   LlmRequest,
   SttCallbacks,
@@ -46,8 +47,16 @@ class FakeLlm implements LlmPort {
 class FakeTts implements TtsPort {
   readonly sampleRate = 24000;
   aborted = 0;
-  constructor(private readonly chunkDelayMs = 5) {}
+  constructor(
+    private readonly chunkDelayMs = 5,
+    /** Sentences containing this text fail (after all port retries). */
+    private readonly failOn?: string,
+  ) {}
   async *synthesize(text: string, signal: AbortSignal): AsyncGenerator<Buffer> {
+    if (this.failOn && text.includes(this.failOn)) {
+      await sleep(this.chunkDelayMs);
+      throw new Error('503 overloaded');
+    }
     for (let i = 0; i < 3; i++) {
       await sleep(this.chunkDelayMs);
       if (signal.aborted) {
@@ -59,7 +68,15 @@ class FakeTts implements TtsPort {
   }
 }
 
-function setup(replies: string[][], tts = new FakeTts()) {
+function setup(
+  replies: string[][],
+  tts = new FakeTts(),
+  extra: {
+    initialHistory?: ChatTurn[];
+    resumed?: boolean;
+    sendTurnMetrics?: boolean;
+  } = {},
+) {
   const stt = new FakeStt();
   const llm = new FakeLlm(replies);
   const events: (ServerMessage | { type: 'audio'; data: string })[] = [];
@@ -74,7 +91,8 @@ function setup(replies: string[][], tts = new FakeTts()) {
     { stt, llm, tts },
     {
       systemPrompt: 'test',
-      sttRetryDelaysMs: [1, 1, 1],
+      conversationId: 'conv-1',
+      ...extra,
     },
   );
   return { session, stt, llm, tts, events, closeSpy };
@@ -106,8 +124,12 @@ describe('ConversationSession', () => {
     await until(() => events.some((e) => e.type === 'tts_end'));
 
     const types = events.map((e) => e.type);
-    expect(types.slice(0, 3)).toEqual([
-      'ready',
+    expect(events[0]).toEqual({
+      type: 'ready',
+      conversationId: 'conv-1',
+      remainingSec: undefined,
+    });
+    expect(types.slice(1, 3)).toEqual([
       'transcript_interim',
       'transcript_final',
     ]);
@@ -161,28 +183,118 @@ describe('ConversationSession', () => {
     session.close();
   });
 
-  it('reconnects STT when the upstream session drops', async () => {
-    const { session, stt, events } = setup([]);
+  it('logs per-turn timing marks in pipeline order', async () => {
+    const { session, stt, events } = setup(
+      [['Sure, that is a lovely idea. ', 'Where would you like to go?']],
+      new FakeTts(),
+      { sendTurnMetrics: true },
+    );
     await session.start();
-    stt.cb!.onUnexpectedClose('goAway');
-    await until(() => stt.connects === 2);
+    session.handleText('{"type":"end_of_audio"}'); // stale: no utterance pending
+    stt.cb!.onInterim('Let us');
+    session.handleText('{"type":"end_of_audio"}');
+    stt.cb!.onFinal('Let us travel.');
+    await until(() => events.some((e) => e.type === 'turn_metrics'));
+
+    const metrics = events.find((e) => e.type === 'turn_metrics') as Record<
+      string,
+      unknown
+    >;
+    expect(metrics).toMatchObject({ turnId: 1, conversationId: 'conv-1' });
+    expect(typeof metrics.finalLagMs).toBe('number');
+    const order = [
+      'final',
+      'llmFirstToken',
+      'firstSentence',
+      'ttsFirstChunk',
+      'firstAudioSent',
+      'llmDone',
+      'ttsEnd',
+    ];
+    const times = order.map((m) => metrics[m] as number);
+    times.forEach((t, i) => expect(typeof t, order[i]).toBe('number'));
+    expect([...times].sort((a, b) => a - b)).toEqual(times);
+    expect(JSON.stringify(metrics)).not.toContain('travel'); // no transcript text
+    session.close();
+  });
+
+  it('skips a sentence whose TTS keeps failing and speaks the rest', async () => {
+    const { session, stt, events } = setup(
+      [
+        [
+          'This is the first sentence here. ',
+          'The second sentence is broken. ',
+          'And here is the third sentence.',
+        ],
+      ],
+      new FakeTts(5, 'broken'),
+    );
+    await session.start();
+    stt.cb!.onFinal('Talk to me.');
+    await until(() => events.some((e) => e.type === 'tts_end'));
+
+    const audio = events.flatMap((e) => (e.type === 'audio' ? [e.data] : []));
+    expect(audio.some((a) => a.startsWith('This is the first'))).toBe(true);
+    expect(audio.some((a) => a.startsWith('And here is the third'))).toBe(true);
+    expect(audio.some((a) => a.includes('broken'))).toBe(false);
     expect(events.some((e) => e.type === 'error')).toBe(false);
     session.close();
   });
 
-  it('gives up when every new STT connection dies immediately', async () => {
-    const { session, stt, events, closeSpy } = setup([]);
+  it('fails the turn only when no sentence produced audio', async () => {
+    const { session, stt, events } = setup(
+      [['Everything here is broken today.']],
+      new FakeTts(5, 'broken'),
+    );
     await session.start();
-    const failed = () => closeSpy.mock.calls.length > 0;
-    // Each reconnect "succeeds" but drops right away (like a rejected API key).
-    for (let i = 0; i < 6 && !failed(); i++) {
-      const connects = stt.connects;
-      stt.cb!.onUnexpectedClose('closed: 1007');
-      await until(() => stt.connects > connects || failed());
-    }
+    stt.cb!.onFinal('Hello?');
+    await until(() => events.some((e) => e.type === 'error'));
+    expect(events.at(-1)).toMatchObject({
+      type: 'error',
+      message: 'failed to generate a reply',
+    });
+    expect(events.some((e) => e.type === 'tts_end')).toBe(false);
+    session.close();
+  });
+
+  it('relays STT status and closes with 1011 once STT gives up', async () => {
+    const { session, stt, events, closeSpy } = setup([
+      ['A long reply that is still being generated when STT dies.'],
+    ]);
+    await session.start();
+    stt.cb!.onStatus!('reconnecting');
+    stt.cb!.onStatus!('ok');
+    expect(events.slice(1)).toEqual([
+      { type: 'status', stt: 'reconnecting' },
+      { type: 'status', stt: 'ok' },
+    ]);
+
+    stt.cb!.onUnexpectedClose('budget exhausted');
     expect(events.at(-1)).toMatchObject({ type: 'error', retryable: true });
     expect(closeSpy).toHaveBeenCalledWith(1011, 'stt unavailable');
-    expect(stt.connects).toBeLessThanOrEqual(5);
+    expect(stt.closed).toBe(false); // the port closed itself already
+    stt.cb!.onFinal('ignored after close');
+    expect(events.some((e) => e.type === 'transcript_final')).toBe(false);
+  });
+
+  it('continues a resumed conversation with its earlier turns', async () => {
+    const initialHistory: ChatTurn[] = [
+      { role: 'user', text: 'I like tea.' },
+      { role: 'assistant', text: 'Nice! Green or black?' },
+    ];
+    const { session, stt, llm, events } = setup(
+      [['Green tea is very healthy indeed.']],
+      new FakeTts(),
+      { initialHistory, resumed: true },
+    );
+    await session.start();
+    expect(events[0]).toMatchObject({ type: 'ready', resumed: true });
+    stt.cb!.onFinal('Green.');
+    await until(() => events.some((e) => e.type === 'tts_end'));
+    expect(llm.requests[0].history).toEqual([
+      ...initialHistory,
+      { role: 'user', text: 'Green.' },
+    ]);
     session.close();
   });
 
