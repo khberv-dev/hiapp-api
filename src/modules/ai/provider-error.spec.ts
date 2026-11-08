@@ -28,6 +28,15 @@ describe('classifyGeminiError', () => {
       'auth',
       false,
     ],
+    // google-auth-library failures (GENAI_BACKEND=vertex)
+    [
+      Object.assign(new Error('invalid_grant: Invalid JWT Signature.'), {
+        status: 400,
+      }),
+      'auth',
+      false,
+    ],
+    [new Error('Could not load the default credentials.'), 'auth', false],
     [apiError(400), 'bad_request', false],
     [apiError(404), 'bad_request', false],
     [new TypeError('fetch failed'), 'network', true],

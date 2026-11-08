@@ -3,7 +3,7 @@ export type ProviderErrorKind =
   | 'rate_limited' // 429, RESOURCE_EXHAUSTED
   | 'timeout' // our own deadline fired
   | 'network' // ECONNRESET, fetch failed, socket closed
-  | 'auth' // 401/403, invalid API key
+  | 'auth' // 401/403, invalid API key or service-account credentials
   | 'bad_request' // 400/404: a config or request bug, never retried
   | 'unknown';
 
@@ -56,7 +56,7 @@ export function classifyGeminiError(
         ? 'rate_limited'
         : status === 401 ||
             status === 403 ||
-            /API key not valid|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED/i.test(
+            /API key not valid|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED|invalid_grant|unauthorized_client|Invalid JWT|Could not load the default credentials|Could not refresh access token/i.test(
               msg,
             )
           ? 'auth'
