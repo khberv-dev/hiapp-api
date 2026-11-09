@@ -2,6 +2,7 @@ import {
   Column,
   CreateDateColumn,
   Entity,
+  Index,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
@@ -17,7 +18,11 @@ export class User {
   @Column({ type: 'varchar', nullable: true })
   lastName: string | null;
 
-  /** Only set when the provider says it's verified. Not unique. */
+  /**
+   * Lowercased (`normalizeEmail`). Only set when the provider says it's
+   * verified. Unique (several nulls are fine), so it can be a sign-in name.
+   */
+  @Index('UQ_users_email', { unique: true })
   @Column({ type: 'varchar', nullable: true })
   email: string | null;
 

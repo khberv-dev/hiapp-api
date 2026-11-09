@@ -10,6 +10,11 @@ const logger = new Logger('App');
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  const config = app.get(ConfigService);
+  // Behind a reverse proxy, req.ip (used by the login rate limit) is the
+  // proxy's address unless Express is told to trust X-Forwarded-For.
+  const trustProxy = parseTrustProxy(config.get<string>('TRUST_PROXY'));
+  if (trustProxy !== undefined) app.set('trust proxy', trustProxy);
   // Static pages (e.g. /privacy_policy) from <project>/public; main.js runs from dist/.
   app.useStaticAssets(join(import.meta.dirname, '..', 'public'), {
     extensions: ['html'],
@@ -23,11 +28,21 @@ async function bootstrap() {
   );
   app.useWebSocketAdapter(new WsAdapter(app));
   app.enableShutdownHooks();
-  const config = app.get(ConfigService);
   const port = config.getOrThrow('PORT');
 
   await app.listen(port);
 
   logger.log(`Listening on :${port}`);
 }
+/** `true`/`false`, a hop count, or an Express trust string (e.g. `loopback`). */
+function parseTrustProxy(
+  raw: string | undefined,
+): boolean | number | string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  if (value === 'true' || value === 'false') return value === 'true';
+  if (/^\d+$/.test(value)) return Number(value);
+  return value;
+}
+
 await bootstrap();

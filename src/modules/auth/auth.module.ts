@@ -5,6 +5,7 @@ import { UserModule } from '../user/user.module.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
 import { GoogleTokenVerifier } from './google-token.verifier.js';
+import { LoginRateLimiter } from './login-rate-limiter.js';
 
 @Module({
   imports: [
@@ -20,6 +21,15 @@ import { GoogleTokenVerifier } from './google-token.verifier.js';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, GoogleTokenVerifier],
+  providers: [
+    AuthService,
+    GoogleTokenVerifier,
+    {
+      provide: LoginRateLimiter,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) =>
+        LoginRateLimiter.fromConfig(config),
+    },
+  ],
 })
 export class AuthModule {}

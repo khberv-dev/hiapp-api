@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Get,
   HttpCode,
   HttpStatus,
   Put,
@@ -9,6 +10,7 @@ import {
 import { CurrentUserId } from '../../common/decorators/current-user-id.decorator.js';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard.js';
 import { UpdatePasswordDto } from './dto/update-password.dto.js';
+import type { MeResponse } from './user-response.js';
 import { UserService } from './user.service.js';
 
 /** The current user. Requires `Authorization: Bearer <accessToken>`. */
@@ -16,6 +18,12 @@ import { UserService } from './user.service.js';
 @UseGuards(JwtAuthGuard)
 export class UserController {
   constructor(private readonly userService: UserService) {}
+
+  /** The current user's profile. 404 if the user was deleted. */
+  @Get('me')
+  me(@CurrentUserId() userId: string): Promise<MeResponse> {
+    return this.userService.getMe(userId);
+  }
 
   /** Sets or replaces the password. The old password isn't required. */
   @Put('password')
